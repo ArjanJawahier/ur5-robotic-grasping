@@ -11,6 +11,5 @@ tensorboardX
 pyrealsense2
 Pillow
 pandas
-attrdict
 pybullet
 

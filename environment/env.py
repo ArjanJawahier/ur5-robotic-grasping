@@ -6,6 +6,7 @@ import pybullet as p
 import pybullet_data
 import random
 
+from typing import Iterable
 
 class FailToReachTargetError(RuntimeError):
     pass
@@ -120,14 +121,14 @@ class Environment:
         """
         p.stepSimulation()
         if self.vis:
-            if self.debug:
-                if self.eef_debug_lineID is not None:
-                    p.removeUserDebugItem(self.eef_debug_lineID)
-                eef_xyz = p.getLinkState(self.robot_id, self.eef_id)[0:1]
-                end = np.array(eef_xyz[0])
-                end[2] -= 0.5
-                self.eef_debug_lineID = p.addUserDebugLine(
-                    np.array(eef_xyz[0]), end, [1, 0, 0])
+            # if self.debug:
+            #     if self.eef_debug_lineID is not None:
+            #         p.removeUserDebugItem(self.eef_debug_lineID)
+            #     eef_xyz = p.getLinkState(self.robot_id, self.eef_id)[0:1]
+            #     end = np.array(eef_xyz[0])
+            #     end[2] -= 0.5
+            #     self.eef_debug_lineID = p.addUserDebugLine(
+            #         np.array(eef_xyz[0]), end, [1, 0, 0])
             time.sleep(self.SIMULATION_STEP_DELAY)
 
     @staticmethod
@@ -140,17 +141,19 @@ class Environment:
     def wait_until_still(self, objID, max_wait_epochs=1000):
         for _ in range(max_wait_epochs):
             self.step_simulation()
-            if self.is_still(objID):
-                return
+
+        if self.is_still(objID):
+            return
         if self.debug:
             print('Warning: Not still after MAX_WAIT_EPOCHS = %d.' %
                   max_wait_epochs)
 
-    def wait_until_all_still(self, max_wait_epochs=1000):
+    def wait_until_all_still(self, max_wait_epochs=300):
         for _ in range(max_wait_epochs):
             self.step_simulation()
             if np.all(list(self.is_still(obj_id) for obj_id in self.obj_ids)):
                 return
+
         if self.debug:
             print('Warning: Not still after MAX_WAIT_EPOCHS = %d.' %
                   max_wait_epochs)
@@ -415,15 +418,15 @@ class Environment:
 
             obj_id, _, _ = self.load_obj(
                 path, pos, yaw, mod_orn, mod_stiffness)
-            for _ in range(10):
+            for _ in range(30):
                 self.step_simulation()
-            self.wait_until_still(obj_id, 150)
+            # self.wait_until_still(obj_id, 150)
 
-        self.wait_until_all_still()
+        # self.wait_until_all_still()
         for handle in box_ids:
             p.removeBody(handle)
         box_ids = self.create_temp_box(0.45, 2)
-        self.wait_until_all_still()
+        # self.wait_until_all_still()
         for handle in box_ids:
             p.removeBody(handle)
         self.wait_until_all_still()
@@ -543,6 +546,69 @@ class Environment:
             print('Failed to reach the target')
         return False, p.getLinkState(self.robot_id, self.eef_id)[0:2]
 
+
+    def grasp_6dof(self, pos: np.ndarray, orn: np.ndarray, lookat: np.ndarray, debug: bool=False):
+        succes_grasp, succes_target = False, False
+        grasped_obj_id = None
+
+        # Move above target
+        self.reset_robot()
+        self.move_gripper(0.1)
+        
+        if debug and self.vis:
+            visual_debug_id = p.loadURDF("environment/urdf/ur5_robotiq_140_end_effector_no_collshape.urdf", useFixedBase=True)
+            num_joints = p.getNumJoints(visual_debug_id)
+            # Disable collisions for the base link
+            p.setCollisionFilterGroupMask(visual_debug_id, -1, collisionFilterGroup=0, collisionFilterMask=0)
+            # Disable collisions for each link in the body
+            for link_index in range(num_joints):
+                p.setCollisionFilterGroupMask(visual_debug_id, link_index, collisionFilterGroup=0, collisionFilterMask=0)
+            p.resetBasePositionAndOrientation(visual_debug_id, pos, orn)
+
+        # self.move_ee([*pos, orn])
+        self.move_ee([*(pos - lookat*0.23), orn])
+        linear_move(pos, self.robot_id, self.controlJoints, self.joints)
+
+        self.auto_close_gripper(check_contact=True)
+        for _ in range(15):
+            self.step_simulation()
+
+        linear_move([pos[0], pos[1], self.GRIPPER_MOVING_HEIGHT], self.robot_id, self.controlJoints, self.joints)
+        # self.move_ee([pos[0], pos[1], self.GRIPPER_MOVING_HEIGHT, orn])
+
+        if debug and self.vis:
+            p.removeBody(visual_debug_id)
+
+        # If the object has been grasped and lifted off the table
+        grasped_id = self.check_grasped_id()
+        if len(grasped_id) == 1:
+            succes_grasp = True
+            grasped_obj_id = grasped_id[0]
+        else:
+            return succes_target, succes_grasp
+
+        # Move object to target zone
+        self.move_away_arm()
+
+        y_drop = self.TARGET_ZONE_POS[2] + 0.15 + 0.15
+
+        #TODO: linear move above target zone
+        self.move_ee([self.TARGET_ZONE_POS[0], self.TARGET_ZONE_POS[1], 1.25, orn])
+        self.move_ee([self.TARGET_ZONE_POS[0], self.TARGET_ZONE_POS[1], y_drop, orn])
+        self.move_gripper(0.085)
+        self.move_ee([self.TARGET_ZONE_POS[0], self.TARGET_ZONE_POS[1], self.GRIPPER_MOVING_HEIGHT, orn])
+
+        # Wait then check if object is in target zone
+        for _ in range(50):
+            self.step_simulation()
+
+        if self.check_target_reached(grasped_obj_id):
+            succes_target = True
+            self.remove_obj(grasped_obj_id)
+
+        return succes_grasp, succes_target
+
+
     def grasp(self, pos: tuple, roll: float, gripper_opening_length: float, obj_height: float, debug: bool = False):
         """
         Method to perform grasp
@@ -562,6 +628,7 @@ class Environment:
         self.move_gripper(0.1)
         orn = p.getQuaternionFromEuler([roll, np.pi/2, 0.0])
         self.move_ee([x, y, self.GRIPPER_MOVING_HEIGHT, orn])
+        self.move_ee_linear
 
         # Reduce grip to get a tighter grip
         gripper_opening_length *= self.GRIP_REDUCTION
@@ -607,3 +674,28 @@ class Environment:
 
     def close(self):
         p.disconnect(self.physicsClient)
+
+
+def get_joint_name(robot_id, joint_id: int) -> str:
+    return p.getJointInfo(robot_id, joint_id)[1].decode('utf-8')
+
+def linear_move(end_point, robot_id: int,  control_joints: Iterable[tuple], joints: dict, end_effector_link_index: int=7):
+    current_point = p.getLinkState(robot_id, end_effector_link_index)[0]
+    current_orn = p.getLinkState(robot_id, end_effector_link_index)[1]
+
+    path = np.linspace(current_point, end_point, 100)
+    for pidx, target_pos in enumerate(path):
+        joint_poses = p.calculateInverseKinematics(robot_id, end_effector_link_index, target_pos, current_orn, maxNumIterations=100)
+
+        # Set Joint motor control of all control joints except the gripper
+        for i, name in enumerate(control_joints[:-1]):
+            joint = joints[name]
+            pose = joint_poses[i]
+            # control robot end-effector
+            p.setJointMotorControl2(robot_id, joint.id, p.POSITION_CONTROL,
+                                    targetPosition=pose, force=joint.maxForce,
+                                    maxVelocity=joint.maxVelocity)
+
+        p.stepSimulation()
+        time.sleep(1./240)
+

@@ -1,4 +1,5 @@
 import random
+from pathlib import Path
 from datetime import datetime
 import os
 import json
@@ -57,7 +58,7 @@ class PackPileData:
             os.mkdir(save_path)
         now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         self.save_dir = f'{save_path}/{now}_{scenario}'
-        os.mkdir(self.save_dir)
+        Path(self.save_dir).mkdir(parents=True, exist_ok=True)
 
         self.tries = 0
         self.succes_grasp = 0

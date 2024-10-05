@@ -1,17 +1,24 @@
+import os
+from datetime import datetime
+from itertools import combinations
+from pathlib import Path
+from typing import Optional
+
+import einops
 import matplotlib.pyplot as plt
 import numpy as np
-from numpy.lib.npyio import save
 import torch.utils.data
-from PIL import Image
-from datetime import datetime
+from pyquaternion import Quaternion
+from sklearn.neighbors import NearestNeighbors
 
+from environment.utilities import Camera
 from network.hardware.device import get_device
 from network.inference.post_process import post_process_output
 from network.utils.data.camera_data import CameraData
-from network.utils.visualisation.plot import plot_results, save_results
 from network.utils.dataset_processing.grasp import detect_grasps
-import os
+from network.utils.visualisation.plot import plot_results, save_results
 
+GRIPPER_LENGTH = 0.23
 
 class GraspGenerator:
     IMG_WIDTH = 224
@@ -22,8 +29,9 @@ class GraspGenerator:
     MAX_GRASP = 0.085
 
     def __init__(self, net_path, camera, depth_radius):
+        self.device = get_device(force_cpu=False)
         self.net = torch.load(net_path, map_location='cpu')
-        self.device = get_device(force_cpu=True)
+        self.net = self.net.to(self.device)
 
         self.near = camera.near
         self.far = camera.far
@@ -123,7 +131,7 @@ class GraspGenerator:
                 q_img, ang_img, width_img=width_img, no_grasps=n_grasps)
             return grasps, save_name
 
-    def predict_grasp(self, rgb, depth, n_grasps=1, show_output=False):
+    def predict_grasp(self, rgb, depth, n_grasps=1, show_output=False, **kwargs):
         predictions, save_name = self.predict(
             rgb, depth, n_grasps=n_grasps, show_output=show_output)
         grasps = []
@@ -133,3 +141,227 @@ class GraspGenerator:
             grasps.append((x, y, z, roll, opening_len, obj_height))
 
         return grasps, save_name
+
+
+def pcd_from_pybullet_depth(
+    depth: np.ndarray, cam, filter_far: bool = True, seg_ids: Optional[np.ndarray]=None
+) -> np.ndarray:
+    """ "Computes the pointcloud from a linear depth map made with PyBullet."""
+    view_mat = np.asarray(cam.view_matrix).reshape([4, 4], order="F")
+    proj_mat = np.asarray(cam.projection_matrix).reshape([4, 4], order="F")
+    cam_to_world = np.linalg.inv(np.matmul(proj_mat, view_mat))
+
+    height, width = depth.shape[:2]
+    y, x = np.mgrid[-1 : 1 : 2 / height, -1 : 1 : 2 / width]
+    y *= -1.0
+    x, y, z = x.reshape(-1), y.reshape(-1), depth.reshape(-1)
+    h = np.ones_like(z)
+    pixels = np.stack([x, y, z, h], axis=1)
+    if filter_far:
+        pixels = pixels[z < 0.999]
+        if seg_ids is not None:
+            seg_ids = seg_ids.reshape(-1)
+            seg_ids = seg_ids[z < 0.999]
+    pixels[:, 2] = 2 * pixels[:, 2] - 1
+
+    # turn pixels to world coordinates
+    points = np.matmul(cam_to_world, pixels.T).T
+    points /= points[:, 3:4]
+    points = points[:, :3]
+    if seg_ids is not None:
+        # Return the seg ids of the points that survived the filter.
+        return points.astype(np.float16), seg_ids
+    else:
+        return points.astype(np.float16)
+
+
+def sample_n_points(pcd: np.ndarray, num_points: int, seg_ids: np.ndarray | None) -> np.ndarray:
+    if pcd.shape[0] < num_points:
+        # Need extra points, sample from pcd and copy
+        indices = np.random.choice(pcd.shape[0], size=num_points - pcd.shape[0], replace=True)
+        pcd = np.concatenate([pcd, pcd[indices]], axis=0)
+        if seg_ids is not None:
+            seg_ids = np.concatenate((seg_ids, seg_ids[indices]), axis=0)
+    else:
+        # Need fewer points, sample from pcd and delete
+        indices = np.random.choice(pcd.shape[0], size=num_points, replace=False)
+        pcd = pcd[indices]
+        if seg_ids is not None:
+            seg_ids = seg_ids[indices]
+    return pcd, seg_ids
+
+def sample_grasp_poses(
+    pcd: np.ndarray,
+    num_poses: int,
+    min_dist: float = 0.15,
+    camera_lookat: np.ndarray | None = None,
+    num_upvecs_per_pos: int = 1,
+    seg_ids: np.ndarray | None = None
+):
+    """
+    Before, we sampled naively.
+    Here, we sample poses with positions near the points of the pcd.
+    Then we sample a random point on the pcd (A).
+    Then we sample a random point B at least `min_dist`,
+    and at most GRIPPER_LENGTH away from A.
+    We sample point B by adding dist * (a random vector) to A. The random vector is -LOOKAT.
+    We sample a random up vector orthogonal to the lookat vector.
+    If the `camera_lookat` is given, we only sample lookat vectors that have a positive dot product with the `camera_lookat`
+    """
+    if len(pcd) == 0:
+        print("WARNING: pcd has no points, cannot sample poses.")
+        raise StopIteration
+
+    # For each point in the pcd, find out how many other points are in a small neighbourhood around it
+    # The more points, the higher the likelihood this point is sampled by the random choice
+    # First, find out the average distance between points by sampling some points
+    pcd = pcd.squeeze()
+
+    print(f"{np.unique(seg_ids)=}")
+    if seg_ids is not None:
+        # table has seg_ids
+        pcd = pcd[seg_ids > 4] # obj ids are higher than 4 in our case
+
+    indices = np.arange(len(pcd))
+    sample_points = pcd[np.random.choice(indices, size=min(len(pcd), 100), replace=False)]
+    pairs = combinations(sample_points, r=2)
+    distances = [np.linalg.norm(pair[0] - pair[1]) for pair in pairs]
+    average_distance = np.mean(distances)
+    densities = np.array([sum([1 for other in pcd if np.linalg.norm(point-other) < average_distance]) for point in sample_points], dtype=np.float32)
+    densities /= np.sum(densities)
+
+    nbrs = NearestNeighbors(n_neighbors=4).fit(pcd)
+
+    sample_indices = np.arange(len(sample_points))
+    index_A = np.random.choice(sample_indices, size=num_poses, replace=True, p=densities)
+    A = sample_points[index_A]
+    normals = []
+
+    # Find the normals of the points in A
+    for query_point in A:
+        distances, indices = nbrs.kneighbors([query_point])
+        neighbors = pcd[indices[0, 1:]] # Take the 3 points next to the point itself.
+        centered_neighbors = neighbors - query_point
+        cov_matrix = np.dot(centered_neighbors.T, centered_neighbors).astype(np.float32)
+        eigenvalues, eigenvectors = np.linalg.eigh(cov_matrix)
+        normal = eigenvectors[:, np.argmin(eigenvalues)] 
+        normals.append(normal)
+
+    R = np.array(normals)
+
+    d = np.random.uniform(min_dist, GRIPPER_LENGTH, size=num_poses)
+    d = np.repeat(d[:, None], 3, axis=-1)
+    L = -R
+    if camera_lookat is not None:
+        L_camera_lookat_dots = np.dot(L, camera_lookat)
+        negative_dots = L_camera_lookat_dots < 0
+        L[negative_dots, 0] *= -1
+    B = A + d * -L
+
+    for pose_idx in range(num_poses):
+        S = np.random.uniform(-1, 1, size=(num_upvecs_per_pos, 3))
+        S /= np.repeat(np.linalg.norm(S, axis=1)[:, None], 3, axis=-1)
+        U = np.cross(L[pose_idx], S)
+        U /= np.repeat(np.linalg.norm(U, axis=1)[:, None], 3, axis=-1)
+        for upvec_idx in range(num_upvecs_per_pos):
+            yield B[pose_idx], L[pose_idx], U[upvec_idx]
+
+
+def quat_from_lookat_and_upvec(
+    gripper_lookat: np.ndarray, gripper_upvec: np.ndarray, pb_format: bool = True
+) -> tuple[float, float, float, float] | Quaternion:
+    """
+    Returns a quaternion in pybullet format: a tuple of floats: (x, y, z, w) if pb_format is True.
+    Returna a pyquaternion.Quaternion if pb_format is False.
+    :param np.ndarray gripper_lookat: (3,) array representing the look-at vector.
+    :param np.ndarray gripper_upvec: (3,) array representing the up-vector.
+    :param bool pb_format: Whether to return a PyBullet quaternion (x, y, z, w).
+    """
+
+    lookat_init = np.array([1.0, 0.0, 0.0])
+    upvec_init = np.array([0.0, 1.0, 0.0])
+
+    lookat_rot_axis = np.cross(lookat_init, gripper_lookat)
+    magnitude = np.linalg.norm(lookat_rot_axis)
+    if magnitude == 0:
+        raise ZeroDivisionError("magnitude of lookat_rot_axis is 0")
+    lookat_rot_axis /= magnitude
+    lookat_dot = np.clip(np.dot(lookat_init, gripper_lookat), -1.0, 1.0)
+    lookat_rot_angle = np.arccos(lookat_dot)
+    first_rot_quat = Quaternion(axis=lookat_rot_axis, angle=lookat_rot_angle)
+
+    rotated_upvec = first_rot_quat.rotate(upvec_init)
+    upvec_rot_axis = np.cross(rotated_upvec, gripper_upvec)
+    upvec_rot_axis /= np.linalg.norm(upvec_rot_axis)
+    upvec_dot = np.dot(rotated_upvec, gripper_upvec)
+    upvec_dot = np.clip(upvec_dot, -1.0, 1.0)
+    upvec_rot_angle = np.arccos(upvec_dot)
+    second_rot_quat = Quaternion(axis=upvec_rot_axis, angle=upvec_rot_angle)
+    gripper_quat = second_rot_quat * first_rot_quat  # ORDER IS IMPORTANT
+
+    if pb_format:
+        gripper_quat = (*gripper_quat.vector, gripper_quat.scalar)
+
+    return gripper_quat
+
+def t_mat_from_grasp_pose(position: np.ndarray, pybullet_quat: tuple[float, float, float, float]):
+    qx, qy, qz, qw = pybullet_quat
+    convention_quat = Quaternion(w=qw, x=qx, y=qy, z=qz)
+    grasp_rot_matrix = convention_quat.rotation_matrix
+    grasp_T_mat = np.eye(4)
+    grasp_T_mat[:3, :3] = grasp_rot_matrix
+    grasp_T_mat[:3, 3] = position
+    return grasp_T_mat
+
+
+class GraspGenerator6DOF(GraspGenerator):
+    def __init__(self, net_path: Path, camera: Camera, depth_radius: int, num_points_per_pcd: int=2048, num_sampled_grasps: int=10):
+        super().__init__(net_path, camera, depth_radius)
+        self.camera = camera
+        self.num_points_per_pcd = num_points_per_pcd
+        self.num_sampled_grasps = num_sampled_grasps
+
+    def predict(self, rgb: np.ndarray, depth: np.ndarray, seg_ids: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        # For the point net, we have to convert the depth array to a pointcloud
+        pcd, seg_ids = pcd_from_pybullet_depth(depth, self.camera, seg_ids=seg_ids)
+
+        if pcd.shape[0] == 0:
+            # No points
+            raise ValueError("No points in the point cloud, cannot predict")
+        
+        pcd, seg_ids = sample_n_points(pcd, num_points=self.num_points_per_pcd, seg_ids=seg_ids)
+        pcd = pcd[None, ...]
+        sampled_grasps = sample_grasp_poses(pcd, num_poses=self.num_sampled_grasps, min_dist=0.15, camera_lookat=self.camera.cam_lookat, seg_ids=seg_ids)
+        pcd = torch.concat((torch.FloatTensor(pcd), torch.ones((1, pcd.shape[1], 1))), axis=2)
+        pcd = pcd.to(self.device)
+        preds = []
+        grasp_positions = []
+        grasp_orns = []
+        grasp_lookats = []
+        for gripper_pos, gripper_lookat, gripper_upvec in sampled_grasps:
+            try:
+                gripper_quat = quat_from_lookat_and_upvec(gripper_lookat, gripper_upvec, pb_format=True)
+            except ZeroDivisionError:
+                continue
+            t_mat = t_mat_from_grasp_pose(gripper_pos, gripper_quat)
+            inv_t_mat = np.linalg.inv(t_mat)
+            inv_t_mat = torch.FloatTensor(inv_t_mat[None, ...]).to(self.device)
+            inv_t_mat = einops.rearrange(inv_t_mat, "b h w -> b (h w)")
+            pred = self.net(pcd=pcd, grasp_pose=inv_t_mat)
+            preds.append(pred.cpu().detach().numpy())
+            grasp_positions.append(gripper_pos)
+            grasp_orns.append(gripper_quat)
+            grasp_lookats.append(gripper_lookat)
+
+        preds = np.array(preds).squeeze()
+        rank_indices = np.flip(np.argsort(preds))
+        ranked_positions = np.array(grasp_positions)[rank_indices]
+        ranked_orns = np.array(grasp_orns)[rank_indices]
+        ranked_lookats = np.array(grasp_lookats)[rank_indices]
+        return ranked_positions, ranked_orns, ranked_lookats
+
+    def predict_grasp(self, rgb: np.ndarray, depth: np.ndarray, seg_ids: np.ndarray, n_grasps: int=1, **kwargs) -> tuple[np.ndarray, np.ndarray]:
+        positions, orientations, lookats = self.predict(rgb, depth, seg_ids)
+        # represent grasps as 10-dim (*pos, *quat, *lookat)
+        grasps = np.hstack((positions, orientations, lookats))
+        return grasps[:n_grasps], None

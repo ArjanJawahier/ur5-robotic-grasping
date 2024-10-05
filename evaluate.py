@@ -1,14 +1,18 @@
-from grasp_generator import GraspGenerator
-from environment.utilities import Camera
-from environment.env import Environment
-from utils import YcbObjects, PackPileData, IsolatedObjData, summarize
-import pybullet as p
 import os
 import sys
+
+import pybullet as p
+from tqdm import trange
+
+from environment.env import Environment
+from environment.utilities import Camera
+from grasp_generator import GraspGenerator, GraspGenerator6DOF
+from utils import IsolatedObjData, PackPileData, YcbObjects, summarize
+
 sys.path.append('network')
 
 
-def isolated_obj_scenario(n, vis, output, debug):
+def isolated_obj_scenario(n, vis, output, debug, generator: GraspGenerator| None=None):
 
     objects = YcbObjects('objects/ycb_objects',
                          mod_orn=['ChipsCan', 'MustardBottle',
@@ -21,7 +25,8 @@ def isolated_obj_scenario(n, vis, output, debug):
     camera = Camera((center_x, center_y, 1.9), (center_x,
                     center_y, 0.785), 0.2, 2.0, (224, 224), 40)
     env = Environment(camera, vis=vis, debug=debug)
-    generator = GraspGenerator(network_path, camera, 5)
+    if not generator:
+        generator = GraspGenerator(network_path, camera, 5)
 
     for obj_name in objects.obj_names:
         print(obj_name)
@@ -60,23 +65,29 @@ def isolated_obj_scenario(n, vis, output, debug):
     summarize(data.save_dir, n)
 
 
-def pile_scenario(n, vis, output, debug):
+def pile_scenario(num_trials: int=100, vis: bool=False, show_output: bool=False, debug: bool=False, baseline: bool=True):
 
-    data = PackPileData(5, n, 'results', 'pile')
     objects = YcbObjects('objects/ycb_objects',
                          mod_orn=['ChipsCan', 'MustardBottle',
                                   'TomatoSoupCan'],
                          mod_stiffness=['Strawberry'],
                          exclude=['CrackerBox', 'Hammer'])
     center_x, center_y = 0.05, -0.52
-    network_path = 'network/trained-models/cornell-randsplit-rgbd-grconvnet3-drop1-ch32/epoch_19_iou_0.98'
     camera = Camera((center_x, center_y, 1.9), (center_x,
                     center_y, 0.785), 0.2, 2.0, (224, 224), 40)
     env = Environment(camera, vis=vis, debug=debug, finger_length=0.06)
-    generator = GraspGenerator(network_path, camera, 5)
+    depth_r = 5
 
-    for i in range(n):
-        print(f'Trial {i}')
+    if baseline:
+        network_path = 'network/trained-models/cornell-randsplit-rgbd-grconvnet3-drop1-ch32/epoch_19_iou_0.98'
+        generator = GraspGenerator(network_path, camera, depth_radius=depth_r)
+    else:
+        network_path = "friction_better_sampling_try3_09/weights/best_tensors.pt"
+        generator = GraspGenerator6DOF(net_path=network_path, camera=camera, depth_radius=depth_r, num_points_per_pcd=4096, num_sampled_grasps=100)
+
+    data = PackPileData(num_obj=5, trials=num_trials, save_path='results', scenario=f'pile_{network_path}')
+
+    for i in trange(num_trials, desc="Doing trials..."):
         straight_fails = 0
         objects.shuffle_objects()
 
@@ -90,21 +101,21 @@ def pile_scenario(n, vis, output, debug):
 
             env.move_away_arm()
             env.reset_all_obj()
-            rgb, depth, _ = camera.get_cam_img()
-            grasps, save_name = generator.predict_grasp(
-                rgb, depth, n_grasps=3, show_output=output)
+            rgb, depth, seg_ids = camera.get_cam_img()
+            grasps, save_name = generator.predict_grasp(rgb, depth, seg_ids=seg_ids, n_grasps=3, show_output=show_output)
 
             for i, grasp in enumerate(grasps):
                 data.add_try()
-                x, y, z, roll, opening_len, obj_height = grasp
+                if baseline:
+                    x, y, z, roll, opening_len, obj_height = grasp 
+                    if vis:
+                        debugID = p.addUserDebugLine([x, y, z], [x, y, 1.2], [0, 0, 1])
+                    succes_grasp, succes_target = env.grasp((x, y, z), roll, opening_len, obj_height)
+                else:
+                    grasp_pos, grasp_orn, grasp_lookat = grasp[:3], grasp[3:7], grasp[7:]
+                    succes_grasp, succes_target = env.grasp_6dof(grasp_pos, grasp_orn, grasp_lookat, debug=True)
 
-                if vis:
-                    debugID = p.addUserDebugLine(
-                        [x, y, z], [x, y, 1.2], [0, 0, 1])
-
-                succes_grasp, succes_target = env.grasp(
-                    (x, y, z), roll, opening_len, obj_height)
-                if vis:
+                if vis and baseline:
                     p.removeUserDebugItem(debugID)
                 if succes_grasp:
                     data.add_succes_grasp()
@@ -112,8 +123,7 @@ def pile_scenario(n, vis, output, debug):
                     data.add_succes_target()
                     straight_fails = 0
                     if save_name is not None:
-                        os.rename(save_name + '.png', save_name +
-                                  f'_SUCCESS_grasp{i}.png')
+                        os.rename(save_name + '.png', save_name + f'_SUCCESS_grasp{i}.png')
                     break
                 else:
                     straight_fails += 1
@@ -126,7 +136,7 @@ def pile_scenario(n, vis, output, debug):
     data.summarize()
 
 
-def pack_scenario(n, vis, output, debug):
+def pack_scenario(n, vis, output, debug, generator: GraspGenerator | None=None):
     vis = vis
     output = output
     debug = debug
@@ -141,7 +151,9 @@ def pack_scenario(n, vis, output, debug):
     camera = Camera((center_x, center_y, 1.9), (center_x,
                     center_y, 0.785), 0.2, 2.0, (224, 224), 40)
     env = Environment(camera, vis=vis, debug=debug, finger_length=0.06)
-    generator = GraspGenerator(network_path, camera, 5)
+
+    if not generator:
+        generator = GraspGenerator(network_path, camera, 5)
 
     for i in range(n):
         print(f'Trial {i}')
@@ -154,9 +166,9 @@ def pack_scenario(n, vis, output, debug):
         while len(env.obj_ids) != 0 and straight_fails < 3:
             env.move_away_arm()
             env.reset_all_obj()
-            rgb, depth, _ = camera.get_cam_img()
+            rgb, depth, seg_ids = camera.get_cam_img()
             grasps, save_name = generator.predict_grasp(
-                rgb, depth, n_grasps=3, show_output=output)
+                rgb, depth, seg_ids=seg_ids, n_grasps=3, show_output=output)
 
             for i, grasp in enumerate(grasps):
                 data.add_try()
@@ -193,4 +205,4 @@ def pack_scenario(n, vis, output, debug):
 if __name__ == '__main__':
     # isolated_obj_scenario(100, vis=False, output=True, debug=False)
     # pack_scenario(100, vis=False, output=True, debug=False)
-    pile_scenario(100, vis=False, output=True, debug=False)
+    pile_scenario(100, vis=False, show_output=True, debug=False)
