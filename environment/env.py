@@ -12,6 +12,17 @@ from logger import get_logger
 
 LOGGER = get_logger(__file__)
 
+def load_debug_gripper(pos: tuple[float, float, float], orn: tuple[float, float, float]) -> int:
+    visual_debug_id = p.loadURDF("environment/urdf/ur5_robotiq_140_end_effector_no_collshape.urdf", useFixedBase=True)
+    num_joints = p.getNumJoints(visual_debug_id)
+    # Disable collisions for the base link
+    p.setCollisionFilterGroupMask(visual_debug_id, -1, collisionFilterGroup=0, collisionFilterMask=0)
+    # Disable collisions for each link in the body
+    for link_index in range(num_joints):
+        p.setCollisionFilterGroupMask(visual_debug_id, link_index, collisionFilterGroup=0, collisionFilterMask=0)
+    p.resetBasePositionAndOrientation(visual_debug_id, pos, orn)
+    return visual_debug_id
+
 class Environment:
     OBJECT_INIT_HEIGHT = 1.05
     GRIPPER_MOVING_HEIGHT = 1.25
@@ -146,6 +157,7 @@ class Environment:
         LOGGER.warning(f'Obj {objID} Not still after MAX_WAIT_EPOCHS = {max_wait_epochs}.')
 
     def wait_until_all_still(self, max_wait_epochs=1000):
+        LOGGER.info(f"Waiting for {len(self.obj_ids)} to be still")
         for _ in range(max_wait_epochs):
             self.step_simulation()
             if np.all(list(self.is_still(obj_id) for obj_id in self.obj_ids)):
@@ -166,18 +178,18 @@ class Environment:
         return x, y, z, roll, pitch, yaw, gripper_opening_length
 
     def reset_robot(self):
-        user_parameters = (-1.5690622952052096, -1.5446774605904932, 1.343946009733127, -1.3708613585093699,
+        reset_position = (-1.5690622952052096, -1.5446774605904932, 1.343946009733127, -1.3708613585093699,
                            -1.5707970583733368, 0.0009377758247187636, 0.085)
         for _ in range(60):
             for i, name in enumerate(self.controlJoints):
                 if i == 6:
                     self.controlGripper(
-                        controlMode=p.POSITION_CONTROL, targetPosition=user_parameters[i])
+                        controlMode=p.POSITION_CONTROL, targetPosition=reset_position[i])
                     break
                 joint = self.joints[name]
                 # control robot joints
                 p.setJointMotorControl2(self.robot_id, joint.id, p.POSITION_CONTROL,
-                                        targetPosition=user_parameters[i], force=joint.maxForce,
+                                        targetPosition=reset_position[i], force=joint.maxForce,
                                         maxVelocity=joint.maxVelocity)
                 self.step_simulation()
 
@@ -198,7 +210,7 @@ class Environment:
         contact_right = p.getContactPoints(
             bodyA=self.robot_id, linkIndexA=right_index)
         contact_ids = set(item[2] for item in contact_left +
-                          contact_right if item[2] in [self.obj_id])
+                          contact_right if item[2] in [self.obj_ids])
         if len(contact_ids) == 1:
             return True
         return False
@@ -549,14 +561,7 @@ class Environment:
         self.move_gripper(0.1)
         
         if debug and self.vis:
-            visual_debug_id = p.loadURDF("environment/urdf/ur5_robotiq_140_end_effector_no_collshape.urdf", useFixedBase=True)
-            num_joints = p.getNumJoints(visual_debug_id)
-            # Disable collisions for the base link
-            p.setCollisionFilterGroupMask(visual_debug_id, -1, collisionFilterGroup=0, collisionFilterMask=0)
-            # Disable collisions for each link in the body
-            for link_index in range(num_joints):
-                p.setCollisionFilterGroupMask(visual_debug_id, link_index, collisionFilterGroup=0, collisionFilterMask=0)
-            p.resetBasePositionAndOrientation(visual_debug_id, pos, orn)
+            visual_debug_id = load_debug_gripper(pos, orn)
 
         # self.move_ee([*pos, orn])
 
@@ -574,9 +579,11 @@ class Environment:
         for _ in range(15):
             self.step_simulation()
 
-        LOGGER.debug("Upwards linear move")
-        linear_move([pos[0], pos[1], self.GRIPPER_MOVING_HEIGHT], self.robot_id, self.controlJoints, self.joints)
+        # LOGGER.debug("Upwards linear move")
+        # linear_move([pos[0], pos[1], self.GRIPPER_MOVING_HEIGHT], self.robot_id, self.controlJoints, self.joints)
 
+        LOGGER.debug("Linear move back to pre-grasp pose")
+        linear_move(pos - lookat*0.1, self.robot_id, self.controlJoints, self.joints)
 
         if debug and self.vis:
             p.removeBody(visual_debug_id)
@@ -593,34 +600,35 @@ class Environment:
 
         LOGGER.debug("Moving away arm")
         self.move_away_arm()
-        for _ in range(1000):
+        for _ in range(100):
             self.step_simulation()
-        y_drop = self.TARGET_ZONE_POS[2] + 0.15 + 0.15
+        y_drop = self.TARGET_ZONE_POS[2] + 0.15 + 0.30
 
         #TODO: linear move above target zone
         LOGGER.debug("Moving ee above target zone pos")
-        self.move_ee([self.TARGET_ZONE_POS[0], self.TARGET_ZONE_POS[1], 1.25, orn])
-        for _ in range(1000):
+        self.move_ee([self.TARGET_ZONE_POS[0], self.TARGET_ZONE_POS[1], y_drop, orn])
+        for _ in range(100):
             self.step_simulation()
 
-        LOGGER.debug("Linear move ee to drop height")
-        linear_move([self.TARGET_ZONE_POS[0], self.TARGET_ZONE_POS[1], y_drop], self.robot_id, self.controlJoints, self.joints)
-        for _ in range(1000):
-            self.step_simulation()
+        # LOGGER.debug("Linear move ee to drop height")
+        # linear_move([self.TARGET_ZONE_POS[0], self.TARGET_ZONE_POS[1], y_drop], self.robot_id, self.controlJoints, self.joints)
+        # for _ in range(1000):
+        #     self.step_simulation()
         # self.move_ee([self.target_zone_pos[0], self.target_zone_pos[1], y_drop, orn])
 
         LOGGER.debug("Move gripper 0.085")
         self.move_gripper(0.085)
-        for _ in range(1000):
+        for _ in range(100):
             self.step_simulation()
 
         LOGGER.debug("Linear move ee to moving height")
         # self.move_ee([self.TARGET_ZONE_POS[0], self.TARGET_ZONE_POS[1], self.GRIPPER_MOVING_HEIGHT, orn])
         linear_move([self.TARGET_ZONE_POS[0], self.TARGET_ZONE_POS[1], self.GRIPPER_MOVING_HEIGHT], self.robot_id, self.controlJoints, self.joints)
-        for _ in range(1000):
+        for _ in range(100):
             self.step_simulation()
 
         # Wait then check if object is in target zone
+        self.reset_robot()
         for _ in range(50):
             self.step_simulation()
 
@@ -652,7 +660,6 @@ class Environment:
         self.move_gripper(0.1)
         orn = p.getQuaternionFromEuler([roll, np.pi/2, 0.0])
         self.move_ee([x, y, self.GRIPPER_MOVING_HEIGHT, orn])
-        self.move_ee_linear
 
         # Reduce grip to get a tighter grip
         gripper_opening_length *= self.GRIP_REDUCTION

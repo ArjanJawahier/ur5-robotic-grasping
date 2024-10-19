@@ -9,7 +9,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pybullet as p
 import torch.utils.data
-import tqdm
 from pybullet_utils.bullet_client import BulletClient
 from pyquaternion import Quaternion
 from sklearn.neighbors import NearestNeighbors
@@ -21,6 +20,7 @@ from network.inference.post_process import post_process_output
 from network.utils.data.camera_data import CameraData
 from network.utils.dataset_processing.grasp import detect_grasps
 from network.utils.visualisation.plot import plot_results, save_results
+from environment.env import load_debug_gripper
 
 LOGGER = get_logger(__file__)
 
@@ -371,6 +371,8 @@ def determine_physical_graspability(
     Determine whether the grasp pose can be reached using the pybullet IK solver.
     If it's not reachable (according to the joint constraints), will return False
     Determine whether the grasp pose would lead to collisions.
+    If the final grasp pose would lead to collisions, return False.
+    Else return True.
     """
     num_joints = client.getNumJoints(robot_id)
     
@@ -389,60 +391,53 @@ def determine_physical_graspability(
     movable_joint_idx = 0
     for joint_index in range(num_joints):
         joint_info = p.getJointInfo(robot_id, joint_index)
-        # Extract the joint name
-        joint_name = joint_info[1].decode("utf-8")
 
         # Extract joint type (revolute, prismatic, fixed, etc.)
         joint_type = joint_info[2]
-
         if joint_type == p.JOINT_FIXED:
             continue
 
         # Extract joint limits (for revolute and prismatic joints)
         joint_lower_limit = joint_info[8]
         joint_upper_limit = joint_info[9]
-
-        # Extract joint velocity and torque limits (if specified)
-        joint_max_velocity = joint_info[11]
-        joint_max_torque = joint_info[10]
-
-        # print(f"Joint {joint_index} ({joint_name}):")
-        # print(f"  - Type: {joint_type}")
-        # print(f"  - Lower limit: {joint_lower_limit}")
-        # print(f"  - Upper limit: {joint_upper_limit}")
-        # print(f"  - Max velocity: {joint_max_velocity}")
-        # print(f"  - Max torque: {joint_max_torque}")
-        # print(joint_angles[movable_joint_idx])
         if joint_angles[movable_joint_idx] < joint_lower_limit or joint_angles[movable_joint_idx] > joint_upper_limit:
             # Grasp is not physically attainable
             return False
         movable_joint_idx += 1
 
-    # Check whether the joints would lead to collisions
+    # Save current joint positions so we can reset them back later
     current_joint_positions = [
         client.getJointState(robot_id, i)[0] for i in range(num_joints)
     ]
 
+    # Check whether the joints would lead to collisions
     i = 0
     for joint_index in range(num_joints):
         joint_info = p.getJointInfo(robot_id, joint_index)
         if joint_info[2] == p.JOINT_FIXED:
             continue
-        client.resetJointState(robot_id, i, joint_angles[i])
+        client.resetJointState(robot_id, joint_index, joint_angles[i])
         i += 1
 
-    is_colliding = False
+    is_not_colliding = True 
+    p.performCollisionDetection()
     for obj_id in object_ids:
-        collision_points = p.getClosestPoints(bodyA=robot_id, bodyB=obj_id, distance=0)
-        if len(collision_points) > 0:
-            is_colliding = True
-            break
+        for robot_link_idx in range(1, num_joints):
+            collision_points = p.getClosestPoints(bodyA=robot_id, linkIndexA=robot_link_idx, bodyB=obj_id, distance=0)
+            # LOGGER.debug(f"robot id: {robot_id}, obj id: {obj_id}, {len(collision_points)=}")
+            if len(collision_points) > 0:
+                is_not_colliding = False
+                break
+
+    # import time
+    # LOGGER.debug(f"is colliding: {not is_not_colliding}")
+    # time.sleep(1)
 
     # Reset back the joints
     for i in range(num_joints):
         client.resetJointState(robot_id, i, current_joint_positions[i])
 
-    return is_colliding
+    return is_not_colliding
 
 
 class GraspGenerator6DOF(GraspGenerator):
@@ -494,7 +489,7 @@ class GraspGenerator6DOF(GraspGenerator):
         grasp_positions = []
         grasp_orns = []
         grasp_lookats = []
-        for gripper_pos, gripper_lookat, gripper_upvec in tqdm.tqdm(sampled_grasps):
+        for gripper_pos, gripper_lookat, gripper_upvec in sampled_grasps:
             try:
                 gripper_quat = quat_from_lookat_and_upvec(
                     gripper_lookat, gripper_upvec, pb_format=True
@@ -502,15 +497,14 @@ class GraspGenerator6DOF(GraspGenerator):
             except ZeroDivisionError:
                 continue
 
-            physical_graspability = determine_physical_graspability(
+            if not determine_physical_graspability(
                 gripper_pos,
                 gripper_quat,
                 self.robot_id,
                 np.unique(seg_ids),
                 self.pb_client,
                 self.ee_link_idx,
-            )
-            if not physical_graspability:
+            ):
                 continue
 
             t_mat = t_mat_from_grasp_pose(gripper_pos, gripper_quat)

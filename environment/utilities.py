@@ -20,6 +20,9 @@ def setup_sisbot(p, robotID, gripper_type):
 
     joints = dict()
 
+
+    controlJointIDs = []
+
     for i in range(numJoints):
         info = p.getJointInfo(robotID, i)
         jointID = info[0]
@@ -32,11 +35,14 @@ def setup_sisbot(p, robotID, gripper_type):
         controllable = True if jointName in controlJoints else False
         info = jointInfo(jointID, jointName, jointType, jointLowerLimit,
                          jointUpperLimit, jointMaxForce, jointMaxVelocity, controllable)
-        if info.type == "REVOLUTE":  # set revolute joint to static
-            p.setJointMotorControl2(
-                robotID, info.id, p.VELOCITY_CONTROL, targetVelocity=0, force=0)
+        # if info.type == "REVOLUTE":  # set revolute joint to static
+        #     p.setJointMotorControl2(
+        #         robotID, info.id, p.VELOCITY_CONTROL, targetVelocity=0, force=0)
         joints[info.name] = info
+        if jointName in controlJoints:
+            controlJointIDs.append(jointID)
 
+    print(f"controlJointIDS: {controlJointIDs}")
     
     # explicitly deal with mimic joints
     def controlGripper(robotID, parent, children, mul, **kwargs):

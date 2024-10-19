@@ -8,6 +8,9 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import FuncFormatter
 from matplotlib.patches import FancyBboxPatch
 
+from logger import get_logger
+
+LOGGER = get_logger(__file__)
 
 class YcbObjects:
     def __init__(self, load_path, mod_orn=None, mod_stiffness=None, exclude=None):
@@ -78,7 +81,8 @@ class PackPileData:
         target_acc = self.succes_target / self.tries
         perc_obj_cleared = self.succes_target / (self.trials * self.num_obj)
 
-        with open(f'{self.save_dir}/summary.txt', 'w') as f:
+        outpath = f'{self.save_dir}/summary.txt'
+        with open(outpath, 'w') as f:
             f.write(
                 f'Stats for {self.num_obj} objects out of {self.trials} trials\n')
             f.write(
@@ -87,6 +91,8 @@ class PackPileData:
                 f'Grasp acc={grasp_acc:.3f} ({self.succes_grasp}/{self.tries})\n')
             f.write(
                 f'Percentage objects cleared={perc_obj_cleared} ({self.succes_target}/{(self.trials * self.num_obj)})\n')
+        
+        LOGGER.info(f"Summary written to {outpath}")
 
 
 class IsolatedObjData:
