@@ -1,16 +1,16 @@
-from environment.utilities import setup_sisbot, Camera
 import math
+import random
 import time
+from typing import Iterable
+
 import numpy as np
 import pybullet as p
 import pybullet_data
-import random
 
-from typing import Iterable
+from environment.utilities import Camera, setup_sisbot
+from logger import get_logger
 
-class FailToReachTargetError(RuntimeError):
-    pass
-
+LOGGER = get_logger(__file__)
 
 class Environment:
     OBJECT_INIT_HEIGHT = 1.05
@@ -135,7 +135,6 @@ class Environment:
     def is_still(handle):
         still_eps = 1e-3
         lin_vel, ang_vel = p.getBaseVelocity(handle)
-        # print(np.abs(lin_vel).sum() + np.abs(ang_vel).sum())
         return np.abs(lin_vel).sum() + np.abs(ang_vel).sum() < still_eps
 
     def wait_until_still(self, objID, max_wait_epochs=1000):
@@ -144,19 +143,14 @@ class Environment:
 
         if self.is_still(objID):
             return
-        if self.debug:
-            print('Warning: Not still after MAX_WAIT_EPOCHS = %d.' %
-                  max_wait_epochs)
+        LOGGER.warning(f'Obj {objID} Not still after MAX_WAIT_EPOCHS = {max_wait_epochs}.')
 
-    def wait_until_all_still(self, max_wait_epochs=300):
+    def wait_until_all_still(self, max_wait_epochs=1000):
         for _ in range(max_wait_epochs):
             self.step_simulation()
             if np.all(list(self.is_still(obj_id) for obj_id in self.obj_ids)):
                 return
-
-        if self.debug:
-            print('Warning: Not still after MAX_WAIT_EPOCHS = %d.' %
-                  max_wait_epochs)
+        LOGGER.warning(f"Some objects not still after MAX_WAIT_EPOCHS = {max_wait_epochs}")
 
     def read_debug_parameter(self):
         # read the value of task parameter
@@ -220,8 +214,8 @@ class Environment:
         contact_ids = set(item[2] for item in contact_left +
                           contact_right if item[2] in self.obj_ids)
         if len(contact_ids) > 1:
-            if self.debug:
-                print('Warning: Multiple items in hand!')
+            LOGGER.warning("Multiple items in hand!")
+
         return list(item_id for item_id in contact_ids if item_id in self.obj_ids)
 
     def check_contact(self, id_a, id_b):
@@ -259,7 +253,6 @@ class Environment:
         right_force = p.getJointState(self.robot_id, right_index)[2][:3]
         left_norm, right_norm = np.linalg.norm(
             left_force), np.linalg.norm(right_force)
-        # print(left_norm, right_norm)
         if bool_operator == 'and':
             return left_norm > force and right_norm > force
         else:
@@ -507,7 +500,7 @@ class Environment:
               0.01, 0.01, 0.01, 0.01, 0.01, 0.01]
         jd = jd * 0
         still_open_flag_ = True  # Hot fix
-        for _ in range(max_step):
+        for step in range(max_step):
             # apply IK
             joint_poses = p.calculateInverseKinematics(self.robot_id, self.eef_id, [x, y, z], orn,
                                                        maxNumIterations=100, jointDamping=jd
@@ -518,7 +511,7 @@ class Environment:
                 pose = joint_poses[i]
                 # control robot end-effector
                 p.setJointMotorControl2(self.robot_id, joint.id, p.POSITION_CONTROL,
-                                        targetPosition=pose, force=joint.maxForce,
+                                        targetPosition=pose, force=joint.maxForce / 2,
                                         maxVelocity=joint.maxVelocity if custom_velocity is None else custom_velocity * (i+1))
 
             self.step_simulation()
@@ -526,8 +519,7 @@ class Environment:
                 still_open_flag_ = self.close_gripper(check_contact=True)
             # Check if contact with objects
             if check_collision_config and self.gripper_contact(**check_collision_config):
-                if self.debug:
-                    print('Collision detected!', self.check_grasped_id())
+                LOGGER.debug(f'Collision detected!, {self.check_grasped_id()}')
                 return False, p.getLinkState(self.robot_id, self.eef_id)[0:2]
             # Check xyz and rpy error
             real_xyz, real_xyzw = p.getLinkState(
@@ -537,13 +529,11 @@ class Environment:
                 real_xyzw)
             if np.linalg.norm(np.array((x, y, z)) - real_xyz) < 0.001 \
                     and np.abs((roll - real_roll, pitch - real_pitch, yaw - real_yaw)).sum() < 0.001:
-                if verbose:
-                    print('Reach target with', _, 'steps')
+
+                LOGGER.info(f'Reach target with {step} steps')
                 return True, (real_xyz, real_xyzw)
 
-        # raise FailToReachTargetError
-        if self.debug:
-            print('Failed to reach the target')
+        LOGGER.warning('Failed to reach the target')
         return False, p.getLinkState(self.robot_id, self.eef_id)[0:2]
 
 
@@ -552,7 +542,10 @@ class Environment:
         grasped_obj_id = None
 
         # Move above target
+        LOGGER.debug("Resetting robot")
         self.reset_robot()
+
+        LOGGER.debug("Moving gripper 0.1")
         self.move_gripper(0.1)
         
         if debug and self.vis:
@@ -566,15 +559,24 @@ class Environment:
             p.resetBasePositionAndOrientation(visual_debug_id, pos, orn)
 
         # self.move_ee([*pos, orn])
-        self.move_ee([*(pos - lookat*0.23), orn])
+
+        LOGGER.debug("Moving to 0.1m away from grasp pose")
+        linear_move(pos - lookat*0.1, self.robot_id, self.controlJoints, self.joints)
+
+        LOGGER.debug("Getting into right orientation")
+        self.move_ee([*(pos - lookat*0.1), orn])
+
+        LOGGER.debug("Linear move to grasp pose")
         linear_move(pos, self.robot_id, self.controlJoints, self.joints)
 
+        LOGGER.debug("Auto-closing gripper")
         self.auto_close_gripper(check_contact=True)
         for _ in range(15):
             self.step_simulation()
 
+        LOGGER.debug("Upwards linear move")
         linear_move([pos[0], pos[1], self.GRIPPER_MOVING_HEIGHT], self.robot_id, self.controlJoints, self.joints)
-        # self.move_ee([pos[0], pos[1], self.GRIPPER_MOVING_HEIGHT, orn])
+
 
         if debug and self.vis:
             p.removeBody(visual_debug_id)
@@ -588,24 +590,46 @@ class Environment:
             return succes_target, succes_grasp
 
         # Move object to target zone
-        self.move_away_arm()
 
+        LOGGER.debug("Moving away arm")
+        self.move_away_arm()
+        for _ in range(1000):
+            self.step_simulation()
         y_drop = self.TARGET_ZONE_POS[2] + 0.15 + 0.15
 
         #TODO: linear move above target zone
+        LOGGER.debug("Moving ee above target zone pos")
         self.move_ee([self.TARGET_ZONE_POS[0], self.TARGET_ZONE_POS[1], 1.25, orn])
-        self.move_ee([self.TARGET_ZONE_POS[0], self.TARGET_ZONE_POS[1], y_drop, orn])
+        for _ in range(1000):
+            self.step_simulation()
+
+        LOGGER.debug("Linear move ee to drop height")
+        linear_move([self.TARGET_ZONE_POS[0], self.TARGET_ZONE_POS[1], y_drop], self.robot_id, self.controlJoints, self.joints)
+        for _ in range(1000):
+            self.step_simulation()
+        # self.move_ee([self.target_zone_pos[0], self.target_zone_pos[1], y_drop, orn])
+
+        LOGGER.debug("Move gripper 0.085")
         self.move_gripper(0.085)
-        self.move_ee([self.TARGET_ZONE_POS[0], self.TARGET_ZONE_POS[1], self.GRIPPER_MOVING_HEIGHT, orn])
+        for _ in range(1000):
+            self.step_simulation()
+
+        LOGGER.debug("Linear move ee to moving height")
+        # self.move_ee([self.TARGET_ZONE_POS[0], self.TARGET_ZONE_POS[1], self.GRIPPER_MOVING_HEIGHT, orn])
+        linear_move([self.TARGET_ZONE_POS[0], self.TARGET_ZONE_POS[1], self.GRIPPER_MOVING_HEIGHT], self.robot_id, self.controlJoints, self.joints)
+        for _ in range(1000):
+            self.step_simulation()
 
         # Wait then check if object is in target zone
         for _ in range(50):
             self.step_simulation()
 
         if self.check_target_reached(grasped_obj_id):
+            LOGGER.info(f"Obj {grasped_obj_id} reached target")
             succes_target = True
             self.remove_obj(grasped_obj_id)
-
+        else:
+            LOGGER.info(f"Obj {grasped_obj_id} did not reach target")
         return succes_grasp, succes_target
 
 
@@ -693,9 +717,8 @@ def linear_move(end_point, robot_id: int,  control_joints: Iterable[tuple], join
             pose = joint_poses[i]
             # control robot end-effector
             p.setJointMotorControl2(robot_id, joint.id, p.POSITION_CONTROL,
-                                    targetPosition=pose, force=joint.maxForce,
+                                    targetPosition=pose, force=joint.maxForce / 2,
                                     maxVelocity=joint.maxVelocity)
 
         p.stepSimulation()
         time.sleep(1./240)
-
